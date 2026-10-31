@@ -1,11 +1,23 @@
 #!/usr/bin/env python3
-"""Legacy Nuvyyo Tablo -> M3U live TV bridge.
+"""Legacy Nuvyyo Tablo -> M3U / HLS bridge.
 
-Exposes:
-  /playlist.m3u        M3U tuner playlist (one entry per Tablo channel)
-  /stream/<oid>.ts     live MPEG-TS relay (ffmpeg remux of Tablo HLS)
-  /guide.xml           XMLTV (from /data/guide.xml when present)
-  /healthz             bridge + Tablo liveness
+Endpoints
+  /playlist.m3u          M3U tuner playlist, rebuilt from the device per request
+  /hls/<oid>.m3u8        HLS for one channel, proxied from the Tablo session
+  /hls/seg?oid=&u=       segment proxy (forwards Range, preserves byteranges)
+  /stream/<oid>.ts       raw MPEG-TS relay of the same session
+  /guide.xml             XMLTV (served from GUIDE_XML when present)
+  /healthz               bridge + device liveness
+
+A Tablo has no API to release a tuner, allocating one takes 6-11 s, and a stale
+session blocks the next allocate. So sessions are cached per channel and fanned
+out: one Tablo session serves the probe, the playback and every other reader,
+and is released only after IDLE_TTL seconds with nobody attached.
+
+Sessions tune in a BACKGROUND thread. A request never blocks the registry, so
+while one client is waiting for the device the next request can attach to the
+same warming session instead of queueing behind a global lock (that serialisation
+was what made a 3-retry proxy give up).
 """
 import json
 import os
@@ -14,16 +26,30 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 TABLO = os.environ.get("TABLO_HOST", "").strip()
-GROUP = os.environ.get("GROUP_NAME", "Live TV")
-DEBUG = os.environ.get("DEBUG") == "1"
 PORT = int(os.environ.get("PORT", "8050"))
 FFMPEG = os.environ.get("FFMPEG", "ffmpeg")
-GUIDE_XML = os.environ.get("GUIDE_XML", "/data/guide.xml")  # optional XMLTV
-PUBLIC_HOST = os.environ.get("PUBLIC_HOST", "")  # host:port used in playlist URLs
+GUIDE_XML = os.environ.get("GUIDE_XML", "/data/guide.xml")
+PUBLIC_HOST = os.environ.get("PUBLIC_HOST", "")
+GROUP = os.environ.get("GROUP_NAME", "Live TV")
+DEBUG = os.environ.get("DEBUG") == "1"
+
+IDLE_TTL = float(os.environ.get("IDLE_TTL", "120"))     # keep a session warm this long
+MAX_SESSIONS = int(os.environ.get("MAX_SESSIONS", "2"))  # physical tuners
+RING = int(os.environ.get("RING_BYTES", str(8 * 1024 * 1024)))   # buffered per session
+BURST = int(os.environ.get("START_BURST", str(1536 * 1024)))     # backfill a new reader
+STREAM_WAIT = float(os.environ.get("STREAM_WAIT", "60"))  # /stream waits for the tuner
+HLS_WAIT = float(os.environ.get("HLS_WAIT", "30"))        # /hls waits for the tuner
+TUNE_TIMEOUT = float(os.environ.get("TUNE_TIMEOUT", "45"))
+
+
+def log(fmt, *args):
+    if DEBUG:
+        sys.stderr.write((fmt % args) + "\n")
 
 
 def tget(path, timeout=15):
@@ -33,11 +59,15 @@ def tget(path, timeout=15):
 
 def tpost(path, body=None, timeout=25):
     data = json.dumps(body if body is not None else {}).encode()
-    req = urllib.request.Request(
-        "http://%s:8885%s" % (TABLO, path), data=data,
-        headers={"Content-Type": "application/json"}, method="POST")
+    req = urllib.request.Request("http://%s:8885%s" % (TABLO, path), data=data,
+                                 headers={"Content-Type": "application/json"}, method="POST")
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.load(r)
+
+
+def http_open(url, headers=None, timeout=20):
+    req = urllib.request.Request(url, headers=headers or {})
+    return urllib.request.urlopen(req, timeout=timeout)
 
 
 def channels():
@@ -48,13 +78,9 @@ def channels():
     out = []
     for p in paths:
         ch = (data.get(p) or {}).get("channel") or {}
-        out.append({
-            "oid": p.rsplit("/", 1)[-1],
-            "call": ch.get("call_sign") or "CH",
-            "major": ch.get("major") or 0,
-            "minor": ch.get("minor") or 0,
-            "network": ch.get("network") or "",
-        })
+        out.append({"oid": p.rsplit("/", 1)[-1], "call": ch.get("call_sign") or "CH",
+                    "major": ch.get("major") or 0, "minor": ch.get("minor") or 0,
+                    "network": ch.get("network") or ""})
     out.sort(key=lambda c: (c["major"], c["minor"]))
     return out
 
@@ -66,52 +92,252 @@ def playlist(public_host):
         label = "%s %s" % (num, c["call"])
         if c["network"]:
             label += " (%s)" % c["network"]
-        # tvg-id is the channel number, which is also what guide.xml uses,
-        # so M3U and XMLTV line up without any manual mapping.
-        lines.append(
-            '#EXTINF:-1 tvg-id="%s" tvg-chno="%s" tvg-name="%s" group-title="%s",%s'
-            % (num, num, c["call"], GROUP, label))
-        lines.append("http://%s/stream/%s.ts" % (public_host, c["oid"]))
+        # HLS, because clients parse an m3u8 in milliseconds while a raw TS makes
+        # ffprobe analyse ~200s of media before it can report codecs.
+        lines.append('#EXTINF:-1 tvg-id="%s" tvg-chno="%s" tvg-name="%s" group-title="%s",%s'
+                     % (num, num, c["call"], GROUP, label))
+        lines.append("http://%s/hls/%s.m3u8" % (public_host, c["oid"]))
     return "\n".join(lines) + "\n"
 
 
 def empty_xmltv():
-    parts = ['<?xml version="1.0" encoding="UTF-8"?>',
-             '<tv generator-info-name="tablo-bridge">']
+    parts = ['<?xml version="1.0" encoding="UTF-8"?>', '<tv generator-name="tablo-bridge">']
     for c in channels():
         num = "%s.%s" % (c["major"], c["minor"])
-        parts.append('  <channel id="%s"><display-name>%s %s</display-name>'
-                     '<display-name>%s</display-name><display-name>%s</display-name></channel>'
-                     % (c["call"], num, c["call"], c["call"], num))
+        parts.append('  <channel id="%s"><display-name>%s %s</display-name></channel>'
+                     % (num, num, c["call"]))
     parts.append("</tv>")
     return "\n".join(parts)
 
 
-def start_stream(oid):
-    """Open a Tablo watch session and spawn ffmpeg remuxing to MPEG-TS on stdout."""
-    started = time.time()
-    w = tpost("/guide/channels/%s/watch" % oid)
-    if not w.get("playlist_url"):
-        raise RuntimeError("tablo returned no playlist_url: %s" % str(w)[:120])
-    if DEBUG:
-        sys.stderr.write("watch %s: session after %.2fs\n" % (oid, time.time() - started))
-    return subprocess.Popen(
-        [FFMPEG, "-hide_banner", "-loglevel", "error", "-nostdin",
-         "-analyzeduration", "0", "-probesize", "32768",
-         "-fflags", "+genpts+nobuffer", "-flags", "low_delay",
-         "-i", w["playlist_url"],
-         "-c", "copy", "-muxdelay", "0", "-muxpreload", "0",
-         "-flush_packets", "1", "-f", "mpegts", "-"],
-        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL, bufsize=0)
+class Busy(Exception):
+    pass
+
+
+class Session:
+    """One Tablo tuner, shared by every reader of that channel."""
+
+    def __init__(self, oid):
+        self.oid = oid
+        self.lock = threading.Condition()
+        self.chunks = []            # [(abs_offset, bytes)]
+        self.base = 0               # absolute offset of chunks[0]
+        self.end = 0                # absolute write position
+        self.readers = 0
+        self.proc = None
+        self.dead = False
+        self.ready = threading.Event()
+        self.error = None
+        self.last_used = time.time()
+        self.master_url = None
+        self.media_url = None
+        self.media_at = 0.0
+        self.hls_lock = threading.Lock()
+
+    # ---- tuner -----------------------------------------------------------
+    def start_async(self):
+        """Tune off the request thread so waiters attach instead of queueing."""
+        threading.Thread(target=self._start, daemon=True).start()
+
+    def _start(self):
+        try:
+            self._tune()
+        except Exception as exc:            # noqa: BLE001
+            self.error = exc
+            self.dead = True
+            log("session %s: tune failed (%s)", self.oid, exc)
+        finally:
+            self.ready.set()
+
+    def _tune(self):
+        started = time.time()
+        w = tpost("/guide/channels/%s/watch" % self.oid, timeout=TUNE_TIMEOUT)
+        if not w.get("playlist_url"):
+            raise Busy("tablo returned no playlist_url")
+        self.master_url = w["playlist_url"]
+        log("session %s: tuner allocated in %.2fs", self.oid, time.time() - started)
+        self.proc = subprocess.Popen(
+            [FFMPEG, "-hide_banner", "-loglevel", "error", "-nostdin",
+             "-analyzeduration", "0", "-probesize", "32768",
+             "-fflags", "+genpts+nobuffer", "-flags", "low_delay",
+             "-i", w["playlist_url"],
+             "-c", "copy", "-muxdelay", "0", "-muxpreload", "0",
+             "-flush_packets", "1", "-f", "mpegts", "-"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, bufsize=0)
+        threading.Thread(target=self._pump, daemon=True).start()
+        log("session %s: ffmpeg started", self.oid)
+
+    def wait_ready(self, timeout):
+        if not self.ready.wait(max(0.0, timeout)):
+            raise Busy("tuning %s" % self.oid)
+        if self.error is not None:
+            raise Busy("tune failed: %s" % self.error)
+        if self.dead:
+            raise Busy("session ended")
+
+    def _pump(self):
+        proc = self.proc
+        while True:
+            try:
+                data = proc.stdout.read(65536)
+            except Exception:               # noqa: BLE001
+                break
+            if not data:
+                break
+            with self.lock:
+                self.chunks.append((self.end, data))
+                self.end += len(data)
+                while self.chunks and self.end - self.chunks[0][0] > RING:
+                    start, buf = self.chunks.pop(0)
+                    self.base = start + len(buf)
+                self.lock.notify_all()
+        with self.lock:
+            self.dead = True
+            self.lock.notify_all()
+        log("session %s: ffmpeg ended", self.oid)
+
+    def stop(self):
+        self.dead = True
+        if self.proc is not None:
+            try:
+                self.proc.kill()
+                self.proc.wait(timeout=5)
+            except Exception:               # noqa: BLE001
+                pass
+
+    def idle_for(self):
+        return time.time() - self.last_used
+
+    # ---- fan-out ---------------------------------------------------------
+    def attach(self):
+        with self.lock:
+            self.readers += 1
+            self.last_used = time.time()
+            return max(self.base, self.end - BURST)
+
+    def detach(self):
+        with self.lock:
+            self.readers = max(0, self.readers - 1)
+            self.last_used = time.time()
+
+    def read_from(self, pos, want=65536, timeout=5.0):
+        """Return (bytes, new_pos); b"" on timeout; None when the session ends."""
+        with self.lock:
+            if pos >= self.end:
+                if self.dead:
+                    return None, pos
+                self.lock.wait(timeout)
+            if pos < self.base:
+                log("session %s: reader fell behind, resyncing", self.oid)
+                pos = self.base
+            if pos >= self.end:
+                return b"", pos
+            out = bytearray()
+            for start, buf in self.chunks:
+                stop = start + len(buf)
+                if stop <= pos:
+                    continue
+                if start <= pos:
+                    out += buf[pos - start:]
+                else:
+                    out += buf
+                pos = stop
+                if len(out) >= want:
+                    break
+            self.last_used = time.time()
+            return bytes(out), pos
+
+    # ---- HLS -------------------------------------------------------------
+    def media_playlist_url(self):
+        """Resolve (and cache) the media playlist behind the master playlist."""
+        with self.hls_lock:
+            if self.media_url and time.time() - self.media_at < 120:
+                return self.media_url
+            try:
+                with http_open(self.master_url) as r:
+                    body = r.read().decode("utf-8", "replace")
+                for line in body.splitlines():
+                    line = line.strip()
+                    if line and not line.startswith("#"):
+                        self.media_url = urllib.parse.urljoin(self.master_url, line)
+                        self.media_at = time.time()
+                        return self.media_url
+            except Exception as exc:        # noqa: BLE001
+                log("session %s: master playlist failed (%s)", self.oid, exc)
+            raise Busy("no media playlist")
+
+    def media_playlist(self):
+        media = self.media_playlist_url()
+        with http_open(media) as r:
+            body = r.read().decode("utf-8", "replace")
+        return media, body
+
+
+class Registry:
+    def __init__(self):
+        self.sessions = {}
+        self.lock = threading.Lock()
+
+    def _make_room(self, oid):
+        """Called with self.lock held: free a tuner slot, preferring idle ones."""
+        alive = [s for s in self.sessions.values() if not s.dead]
+        if len(alive) < MAX_SESSIONS:
+            return
+        idle = [s for s in alive if s.readers == 0 and s.ready.is_set()]
+        if not idle:
+            raise Busy("all %d tuners are in use" % MAX_SESSIONS)
+        victim = min(idle, key=lambda s: s.last_used)
+        log("evicting idle session %s for %s", victim.oid, oid)
+        victim.stop()
+        self.sessions.pop(victim.oid, None)
+
+    def acquire(self, oid, wait=0.0):
+        with self.lock:
+            s = self.sessions.get(oid)
+            if s is not None and s.dead and s.ready.is_set():
+                self.sessions.pop(oid, None)
+                s = None
+            fresh = s is None
+            if fresh:
+                self._make_room(oid)
+                s = Session(oid)
+                self.sessions[oid] = s
+                s.start_async()
+                log("session %s: tuning", oid)
+            s.last_used = time.time()
+        s.wait_ready(wait)
+        return s
+
+    def snapshot(self):
+        with self.lock:
+            return {oid: {"readers": s.readers, "ready": s.ready.is_set(),
+                          "dead": s.dead, "buf": s.end - s.base}
+                    for oid, s in self.sessions.items()}
+
+    def reap(self):
+        while True:
+            time.sleep(5)
+            with self.lock:
+                for oid, s in list(self.sessions.items()):
+                    if s.dead and s.ready.is_set():
+                        self.sessions.pop(oid, None)
+                    elif s.readers == 0 and s.idle_for() > IDLE_TTL:
+                        log("closing idle session %s", oid)
+                        s.stop()
+                        self.sessions.pop(oid, None)
+
+
+REG = Registry()
 
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-    server_version = "tablo-bridge/1.0"
+    server_version = "tablo-bridge/2.1"
 
     def log_message(self, fmt, *args):
-        sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
+        if DEBUG:
+            sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
 
     def _send(self, code, body, ctype="text/plain; charset=utf-8"):
         if isinstance(body, str):
@@ -121,28 +347,36 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
-        self.wfile.write(body)
+        if self.command != "HEAD":
+            self.wfile.write(body)
 
     def do_HEAD(self):
-        # Dispatcharr probes with HEAD; answering 200 with an empty body makes
-        # its stream manager mark the channel dead, so refuse the method and let
-        # it fall back to GET (which works).
+        path = self.path.split("?")[0]
+        if path.startswith("/stream/") or (path.startswith("/hls/") and path.endswith(".m3u8")):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/vnd.apple.mpegurl"
+                             if path.endswith(".m3u8") else "video/mp2t")
+            self.send_header("Content-Length", "0")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            return
         self.send_response(405)
         self.send_header("Allow", "GET")
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.send_header("Content-Length", "0")
-        self.send_header("Connection", "close")
         self.end_headers()
 
     def do_GET(self):
-        path = self.path.split("?")[0]
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+        query = urllib.parse.parse_qs(parsed.query)
         host = PUBLIC_HOST or self.headers.get("Host") or "127.0.0.1:%d" % PORT
         try:
             if path in ("/", "/index.html"):
-                self._send(200, "Tablo bridge OK. Endpoints: /playlist.m3u /guide.xml /healthz\n")
+                self._send(200, "tablo-bridge: /playlist.m3u /hls/<id>.m3u8 /stream/<id>.ts "
+                                "/guide.xml /healthz\n")
             elif path == "/healthz":
-                self._send(200, json.dumps({"tablo": TABLO, "channels": len(channels())}),
-                           "application/json")
+                self._send(200, json.dumps({"tablo": TABLO, "channels": len(channels()),
+                                            "sessions": REG.snapshot()}), "application/json")
             elif path.endswith(".m3u"):
                 self._send(200, playlist(host), "audio/x-mpegurl")
             elif path.endswith(".xml") or path.endswith(".xmltv"):
@@ -151,73 +385,97 @@ class Handler(BaseHTTPRequestHandler):
                         self._send(200, f.read(), "application/xml")
                 else:
                     self._send(200, empty_xmltv(), "application/xml")
+            elif path == "/hls/seg.ts":
+                self.segment(query)
+            elif path.startswith("/hls/") and path.endswith(".m3u8"):
+                self.hls(host, path[len("/hls/"):].split(".")[0])
             elif path.startswith("/stream/"):
-                oid = path[len("/stream/"):].split(".")[0]
-                self.stream(oid)
+                self.stream(path[len("/stream/"):].split(".")[0])
             else:
                 self._send(404, "not found\n")
         except (BrokenPipeError, ConnectionResetError):
             pass
-        except Exception as exc:  # noqa: BLE001
+        except Busy as exc:
+            self._send(503, "tablo: %s\n" % exc)
+        except Exception as exc:            # noqa: BLE001
             try:
-                self._send(500, "error: %s\n" % exc)
-            except Exception:
+                self._send(502, "bridge error: %s\n" % exc)
+            except Exception:               # noqa: BLE001
                 pass
 
-    def stream(self, oid):
-        """Open a Tablo watch session and relay it as MPEG-TS."""
-        proc = None
-        started = time.time()
+    # ---- HLS -------------------------------------------------------------
+    def hls(self, host, oid):
+        sess = REG.acquire(oid, HLS_WAIT)
+        media, body = sess.media_playlist()
+        out = []
+        for line in body.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                out.append(line)
+                continue
+            seg = urllib.parse.urljoin(media, line)
+            out.append("http://%s/hls/seg.ts?oid=%s&u=%s"
+                       % (host, oid, urllib.parse.quote(seg, safe="")))
+        self._send(200, "\n".join(out) + "\n", "application/vnd.apple.mpegurl")
+
+    def segment(self, query):
+        oid = (query.get("oid") or [""])[0]
+        url = (query.get("u") or [""])[0]
+        if not url:
+            self._send(400, "missing segment url\n")
+            return
+        headers = {}
+        if self.headers.get("Range"):
+            headers["Range"] = self.headers["Range"]
         try:
-            for attempt in range(3):
-                try:
-                    proc = start_stream(oid)
-                except urllib.error.HTTPError as exc:
-                    # Tablo answers 503 itself when no tuner can be allocated
-                    self._send(503, "tablo refused a tuner (HTTP %s)\n" % exc.code)
-                    return
-                except Exception as exc:  # noqa: BLE001
-                    self._send(502, "tablo watch failed: %s\n" % exc)
-                    return
-                first = proc.stdout.read(4096)
-                if first:
-                    if DEBUG:
-                        sys.stderr.write("stream %s: first bytes after %.2fs\n"
-                                         % (oid, time.time() - started))
-                    break
-                proc.kill()
-                proc = None
-                time.sleep(1)
-            if proc is None:
-                self._send(503, "tablo returned no stream (all tuners busy?)\n")
-                return
+            resp = http_open(url, headers=headers, timeout=25)
+        except urllib.error.HTTPError as exc:
+            self._send(exc.code, "segment fetch failed\n")
+            return
+        self.send_response(resp.status)
+        self.send_header("Content-Type", resp.headers.get("Content-Type", "video/mp2t"))
+        for h in ("Content-Length", "Content-Range", "Accept-Ranges"):
+            if resp.headers.get(h):
+                self.send_header(h, resp.headers[h])
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        while True:
+            chunk = resp.read(262144)
+            if not chunk:
+                break
+            self.wfile.write(chunk)
+        resp.close()
+
+    # ---- raw TS ----------------------------------------------------------
+    def stream(self, oid):
+        sess = REG.acquire(oid, STREAM_WAIT)
+        pos = sess.attach()
+        try:
             self.close_connection = True
             self.send_response(200)
             self.send_header("Content-Type", "video/mp2t")
             self.send_header("Cache-Control", "no-store")
             self.send_header("Connection", "close")
             self.end_headers()
-            chunk = first
-            while chunk:
-                self.wfile.write(chunk)
-                chunk = proc.stdout.read(65536)
+            while True:
+                data, pos = sess.read_from(pos)
+                if data is None:
+                    break
+                if data:
+                    self.wfile.write(data)
         except (BrokenPipeError, ConnectionResetError):
             pass
         finally:
-            if proc is not None:
-                try:
-                    proc.kill()
-                    proc.wait(timeout=5)
-                except Exception:
-                    pass
+            sess.detach()
 
 
 def main():
     if not TABLO:
         sys.exit("TABLO_HOST is required (hostname or IP of the Tablo)")
+    threading.Thread(target=REG.reap, daemon=True).start()
     srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     srv.daemon_threads = True
-    sys.stderr.write("tablo-bridge listening on :%d (tablo %s)\n" % (PORT, TABLO))
+    sys.stderr.write("tablo-bridge 2.1 listening on :%d (tablo %s)\n" % (PORT, TABLO))
     srv.serve_forever()
 
 
