@@ -63,7 +63,7 @@ POST /guide/channels/<object_id>/watch      body: {}
   "token": "08fab103-...",
   "expires": "2026-10-30T20:42:31Z",
   "keepalive": 165,
-  "playlist_url": "http://192.168.86.20:80/stream/pl.m3u8?8cklsVtXbieXBe_UgKpGOA",
+  "playlist_url": "http://192.168.1.50:80/stream/pl.m3u8?8cklsVtXbieXBe_UgKpGOA",
   "video_details": {"width": 0, "height": 0, "container_format": "mpeg4"},
   "canRecord": true
 }
