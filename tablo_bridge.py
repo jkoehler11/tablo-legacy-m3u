@@ -89,21 +89,21 @@ def empty_xmltv():
 
 def start_stream(oid):
     """Open a Tablo watch session and spawn ffmpeg remuxing to MPEG-TS on stdout."""
-    import time as _t
-    _t0 = _t.time()
+    started = time.time()
     w = tpost("/guide/channels/%s/watch" % oid)
-    _t1 = _t.time()
-    proc = subprocess.Popen(
+    if not w.get("playlist_url"):
+        raise RuntimeError("tablo returned no playlist_url: %s" % str(w)[:120])
+    if DEBUG:
+        sys.stderr.write("watch %s: session after %.2fs\n" % (oid, time.time() - started))
+    return subprocess.Popen(
         [FFMPEG, "-hide_banner", "-loglevel", "error", "-nostdin",
          "-analyzeduration", "0", "-probesize", "32768",
          "-fflags", "+genpts+nobuffer", "-flags", "low_delay",
          "-i", w["playlist_url"],
          "-c", "copy", "-muxdelay", "0", "-muxpreload", "0",
          "-flush_packets", "1", "-f", "mpegts", "-"],
-        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
-    if DEBUG:
-        sys.stderr.write("watch %s: POST %.2fs\n" % (oid, _t1 - _t0))
-    return proc
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL, bufsize=0)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -165,27 +165,31 @@ class Handler(BaseHTTPRequestHandler):
                 pass
 
     def stream(self, oid):
+        """Open a Tablo watch session and relay it as MPEG-TS."""
         proc = None
+        started = time.time()
         try:
             for attempt in range(3):
                 try:
                     proc = start_stream(oid)
                 except urllib.error.HTTPError as exc:
-                    # 503 = all tuners busy
-                    self._send(503, "tablo refused tuner (%s)\n" % exc.code)
+                    # Tablo answers 503 itself when no tuner can be allocated
+                    self._send(503, "tablo refused a tuner (HTTP %s)\n" % exc.code)
                     return
-                _tf = _t.time()
+                except Exception as exc:  # noqa: BLE001
+                    self._send(502, "tablo watch failed: %s\n" % exc)
+                    return
                 first = proc.stdout.read(4096)
-                if DEBUG:
-                    sys.stderr.write("watch %s: first bytes after %.2fs (total %.2fs)\n"
-                                     % (oid, _t.time() - _tf, _t.time() - _t0))
                 if first:
+                    if DEBUG:
+                        sys.stderr.write("stream %s: first bytes after %.2fs\n"
+                                         % (oid, time.time() - started))
                     break
                 proc.kill()
                 proc = None
                 time.sleep(1)
             if proc is None:
-                self._send(502, "tablo produced no stream\n")
+                self._send(503, "tablo returned no stream (all tuners busy?)\n")
                 return
             self.close_connection = True
             self.send_response(200)
@@ -197,6 +201,8 @@ class Handler(BaseHTTPRequestHandler):
             while chunk:
                 self.wfile.write(chunk)
                 chunk = proc.stdout.read(65536)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
         finally:
             if proc is not None:
                 try:
