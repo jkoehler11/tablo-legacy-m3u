@@ -8,6 +8,23 @@ Tablo never shipped an M3U or HDHomeRun interface, and the vendor's own apps for
 these devices were shut down in September 2026. The local REST API on port 8885,
 however, is still open and still works. This project wraps it.
 
+## Which hardware this works with
+
+This speaks the **legacy local REST API on port 8885**. Whether a unit has it is a
+one-command question — if this returns JSON with a `model` field, the unit is
+supported:
+
+```sh
+curl -s http://<tablo-ip>:8885/server/info
+```
+
+| Hardware | Works | Notes |
+| --- | --- | --- |
+| Legacy network Tablo — 2-Tuner, 4-Tuner, DUAL LITE, QUAD (Nuvyyo era, firmware 2.2.x) | **Yes** | What this project was written against: a Tablo 2-Tuner on firmware 2.2.60. No authentication anywhere — every endpoint answers unauthenticated. Set `MAX_SESSIONS` to the number of tuners the unit actually has (default 2). |
+| 4th-generation Tablo (2023 and later, the current models) | **No** | There is no local API at all. It is managed through Tablo's cloud service and the only API is cloud-authenticated, so there is no port to point a bridge at. This is a different device, not a different firmware. |
+| Legacy HDMI-only models (Tablo DUAL HDMI, QUAD HDMI) | **No** (expected) | Different firmware branch; they stream to a TV over HDMI rather than over the network. Run the command above before assuming. |
+| HDHomeRun and other network tuners | Not applicable | They already speak M3U/HDHomeRun or are supported natively by Jellyfin, Emby and Dispatcharr — no bridge needed. |
+
 ```
 antenna ──► Tablo (2 or 4 tuners)
                 │  POST /guide/channels/<id>/watch  ──► HLS
