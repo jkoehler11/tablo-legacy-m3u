@@ -2,7 +2,10 @@
 """Legacy Nuvyyo Tablo -> M3U / HLS bridge.
 
 Endpoints
-  /playlist.m3u          M3U tuner playlist, rebuilt from the device per request
+  /playlist.m3u          M3U playlist of raw-TS URLs (for a proxy like Dispatcharr)
+  /playlist.m3u?format=hls
+                         the same playlist advertising HLS (for a media server
+                         that probes the tuner itself, e.g. Jellyfin directly)
   /hls/<oid>.m3u8        HLS for one channel, proxied from the Tablo session
   /hls/seg?oid=&u=       segment proxy (forwards Range, preserves byteranges)
   /stream/<oid>.ts       raw MPEG-TS relay of the same session
@@ -85,18 +88,24 @@ def channels():
     return out
 
 
-def playlist(public_host):
+def playlist(public_host, fmt="ts"):
+    """Raw TS by default, because a proxy (Dispatcharr) reads bytes and turns a
+    .m3u8 URL into a needless ffmpeg transcode; HLS on request, because a media
+    server probing an endless TS never finishes its analyze window."""
+    hls = str(fmt).lower() == "hls"
     lines = ["#EXTM3U"]
     for c in channels():
         num = "%s.%s" % (c["major"], c["minor"])
         label = "%s %s" % (num, c["call"])
         if c["network"]:
             label += " (%s)" % c["network"]
-        # HLS, because clients parse an m3u8 in milliseconds while a raw TS makes
-        # ffprobe analyse ~200s of media before it can report codecs.
+        # tvg-id is the call sign, matching the XMLTV channel ids; tvg-chno is the
+        # dial position. Dispatcharr hashes a stream on url+tvg-id, so changing
+        # either one re-creates every stream on the next refresh.
         lines.append('#EXTINF:-1 tvg-id="%s" tvg-chno="%s" tvg-name="%s" group-title="%s",%s'
-                     % (num, num, c["call"], GROUP, label))
-        lines.append("http://%s/hls/%s.m3u8" % (public_host, c["oid"]))
+                     % (c["call"], num, c["call"], GROUP, label))
+        lines.append(("http://%s/hls/%s.m3u8" if hls else "http://%s/stream/%s.ts")
+                     % (public_host, c["oid"]))
     return "\n".join(lines) + "\n"
 
 
@@ -378,7 +387,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, json.dumps({"tablo": TABLO, "channels": len(channels()),
                                             "sessions": REG.snapshot()}), "application/json")
             elif path.endswith(".m3u"):
-                self._send(200, playlist(host), "audio/x-mpegurl")
+                fmt = (query.get("format") or ["ts"])[0]
+                self._send(200, playlist(host, fmt), "audio/x-mpegurl")
             elif path.endswith(".xml") or path.endswith(".xmltv"):
                 if os.path.exists(GUIDE_XML):
                     with open(GUIDE_XML, "rb") as f:
