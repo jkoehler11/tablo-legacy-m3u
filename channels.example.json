@@ -1,11 +1,29 @@
 {
   "source": "https://epgshare01.online/epgshare01/epg_ripper_US_LOCALS1.xml.gz",
   "channels": {
-    "WUCW-DT.us_locals1": {"id": "23.1", "name": "23.1 CW"},
-    "WCCO-DT.us_locals1": {"id": "4.1", "name": "4.1 CBS"},
-    "KSTP-DT.us_locals1": {"id": "5.1", "name": "5.1 ABC"},
-    "KARE-DT.us_locals1": {"id": "11.1", "name": "11.1 NBC"},
-    "KMSP-DT.us_locals1": {"id": "9.1", "name": "9.1 FOX"},
-    "KTCA-DT.us_locals1": {"id": "2.1", "name": "2.1 PBS"}
+    "KTCA-DT.us_locals1": {
+      "id": "TPT2",
+      "name": "2.1 TPT2"
+    },
+    "WCCO-DT.us_locals1": {
+      "id": "WCCO",
+      "name": "4.1 WCCO"
+    },
+    "KSTP-DT.us_locals1": {
+      "id": "KSTP",
+      "name": "5.1 KSTP"
+    },
+    "KMSP-DT.us_locals1": {
+      "id": "FOX9",
+      "name": "9.1 FOX9"
+    },
+    "KARE-DT.us_locals1": {
+      "id": "KARE",
+      "name": "11.1 KARE"
+    },
+    "WUCW-DT.us_locals1": {
+      "id": "TheCW",
+      "name": "23.1 TheCW"
+    }
   }
 }

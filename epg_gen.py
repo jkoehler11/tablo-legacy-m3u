@@ -10,8 +10,11 @@ Configured by JSON (default /data/channels.json):
     }
   }
 
-"id" must match the tvg-id the bridge emits (the channel number), so the
-playlist and the guide line up with no manual mapping in the client.
+"id" is what the guide publishes as the channel id. Clients match it against
+the playlist tvg-id (the channel number) first and fall back to a display-name,
+so either form works; this deployment uses station call signs because
+Dispatcharr's EPG channel mapping was built on them. "name" becomes the first
+display-name and is the safest thing to match on.
 """
 import gzip
 import json

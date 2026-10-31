@@ -71,13 +71,16 @@ Channel numbers and `tvg-id`s already match, so no manual mapping is needed.
 {
   "source": "https://epgshare01.online/epgshare01/epg_ripper_US_LOCALS1.xml.gz",
   "channels": {
-    "WCCO-DT.us_locals1": {"id": "4.1", "name": "4.1 CBS"}
+    "WCCO-DT.us_locals1": {"id": "WCCO", "name": "4.1 WCCO"}
   }
 }
 ```
 
-`id` must equal the channel number the Tablo reports, because the bridge emits
-that as `tvg-id` and the guide uses the same value.
+`id` is the guide channel id. A client matches it to the playlist `tvg-id`
+(the channel number the Tablo reports) first and falls back to a display-name,
+so either the number (`"4.1"`) or the station call sign (`"WCCO"`) maps. This
+deployment uses call signs because Dispatcharr's EPG channel mapping is built
+on them; `name` becomes the first display-name and always matches.
 
 Finding the source ids: download the feed once and grep for your call sign —
 
