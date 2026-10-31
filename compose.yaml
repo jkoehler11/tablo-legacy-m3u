@@ -1,0 +1,26 @@
+services:
+  tablo-bridge:
+    build: .
+    container_name: tablo-bridge
+    restart: unless-stopped
+    ports:
+      - "8050:8050"
+    environment:
+      TABLO_HOST: ${TABLO_HOST:?set TABLO_HOST to your Tablo's address}
+      PUBLIC_HOST: ${PUBLIC_HOST:?set PUBLIC_HOST to host:8050 as clients see it}
+      GROUP_NAME: ${GROUP_NAME:-Live TV}
+      GUIDE_XML: /data/guide.xml
+    volumes:
+      - ./data:/data
+
+  tablo-epg:
+    build: .
+    container_name: tablo-epg
+    restart: unless-stopped
+    command: ["python3", "-u", "/app/epg_gen.py"]
+    environment:
+      EPG_CONFIG: /data/channels.json
+      EPG_OUT: /data/guide.xml
+      EPG_INTERVAL: "21600"
+    volumes:
+      - ./data:/data

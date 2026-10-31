@@ -1,0 +1,7 @@
+data/*.ts
+data/guide.xml
+data/guide.xml.tmp
+data/channels.json
+.env
+__pycache__/
+*.pyc
