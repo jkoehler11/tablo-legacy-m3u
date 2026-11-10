@@ -167,7 +167,7 @@ class Session:
         log("session %s: tuner allocated in %.2fs", self.oid, time.time() - started)
         self.proc = subprocess.Popen(
             [FFMPEG, "-hide_banner", "-loglevel", "error", "-nostdin",
-             "-analyzeduration", "0", "-probesize", "32768",
+             "-analyzeduration", "3000000", "-probesize", "1000000",
              "-fflags", "+genpts+nobuffer", "-flags", "low_delay",
              "-i", w["playlist_url"],
              "-c", "copy", "-muxdelay", "0", "-muxpreload", "0",
