@@ -130,7 +130,7 @@ calling `watch` per viewer.
   map it sees carries **only the video PID** the session serves video-only for
   its whole life — and, because sessions are cached and fanned out, for every
   reader that attaches to it. Probing wider (`-probesize`, `-analyzeduration`)
-  is what sees the AC-3 PID, because the device rewrites the PMT per segment.
+  is what sees the audio PID, because the device rewrites the PMT per segment.
   Probing wider also delays the first byte, which is the failure above, so the
   window is bounded: `PROBESIZE` 1,000,000 bytes and `ANALYZEDURATION`
   3,000,000 µs by default. At OTA bitrates the byte limit binds first — roughly
@@ -145,7 +145,10 @@ calling `watch` per viewer.
 
 ## Codecs
 
-H.264 video (1080i or 720p depending on the station) with AC-3 audio (ATSC
-A/52) — not AAC, which is what the client-facing transcode of a media server
-would produce. Wrapped in MPEG-TS after the segments are concatenated. Stream
-copy works; no transcoding is needed to remux.
+H.264 video (1080i or 720p depending on the station) with AAC stereo audio on
+the 2-Tuner tested here (firmware 2.2.60): `probed streams: video/h264,
+audio/aac` on WCCO 4.1 and KARE 11.1. The audio codec is not fixed across units
+or stations — AC-3 (ATSC A/52) was the report that prompted the probe work — so
+treat the probe log line as authoritative for a given unit rather than this
+paragraph. Wrapped in MPEG-TS after the segments are concatenated; stream copy
+works either way and no transcoding is needed to remux.

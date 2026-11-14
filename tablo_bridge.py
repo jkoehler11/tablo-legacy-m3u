@@ -42,7 +42,7 @@ FFMPEG = os.environ.get("FFMPEG", "ffmpeg")
 # fixed once ffmpeg has probed, so if the first programme map it sees carries only
 # the video PID the whole session is video-only — and, because sessions are cached
 # and fanned out, so is every reader that attaches to it. A wider window reaches
-# past that first map to a later one that names the AC-3 PID, but it must stay
+# past that first map to a later one that names the audio PID, but it must stay
 # bounded: clients ffprobe the endless TS and give up if the first bytes are slow
 # (see "Probing behaviour" in docs/TABLO-API.md). ANALYZEDURATION is
 # microseconds, PROBESIZE bytes; at OTA bitrates the byte limit usually binds
