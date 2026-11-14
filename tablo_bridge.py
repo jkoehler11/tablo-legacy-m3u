@@ -24,6 +24,7 @@ was what made a 3-retry proxy give up).
 """
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -36,6 +37,30 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 TABLO = os.environ.get("TABLO_HOST", "").strip()
 PORT = int(os.environ.get("PORT", "8050"))
 FFMPEG = os.environ.get("FFMPEG", "ffmpeg")
+
+# Input probe window for the raw-TS remux. With -c copy the output stream set is
+# fixed once ffmpeg has probed, so if the first programme map it sees carries only
+# the video PID the whole session is video-only — and, because sessions are cached
+# and fanned out, so is every reader that attaches to it. A wider window reaches
+# past that first map to a later one that names the AC-3 PID, but it must stay
+# bounded: clients ffprobe the endless TS and give up if the first bytes are slow
+# (see "Probing behaviour" in docs/TABLO-API.md). ANALYZEDURATION is
+# microseconds, PROBESIZE bytes; at OTA bitrates the byte limit usually binds
+# first, roughly half a second at 15 Mbps.
+ANALYZEDURATION = int(os.environ.get("ANALYZEDURATION", "3000000"))
+PROBESIZE = int(os.environ.get("PROBESIZE", "1000000"))
+PROBE_TRIES = max(1, int(os.environ.get("PROBE_TRIES", "2")))
+PROBE_INFO_TIMEOUT = float(os.environ.get("PROBE_INFO_TIMEOUT", "12"))
+# A retry widens the window instead of repeating it. The device's media playlist
+# declares ~1.37 MB per one-second segment, so the default 1 MB does not span a
+# whole segment; the retry reads several. Only a probe that came back video-only
+# pays that latency.
+RETRY_WIDEN = 4
+RETRY_MAX_ANALYZE = 6000000     # µs; ~6 s, enough for four one-second segments
+# A retry must read *different* media to stand any chance of a different
+# programme map; the device's segments are one second, so wait for the playlist
+# to roll past the bad one before reopening it.
+RETRY_DELAY = 1.5
 GUIDE_XML = os.environ.get("GUIDE_XML", "/data/guide.xml")
 PUBLIC_HOST = os.environ.get("PUBLIC_HOST", "")
 GROUP = os.environ.get("GROUP_NAME", "Live TV")
@@ -53,6 +78,20 @@ TUNE_TIMEOUT = float(os.environ.get("TUNE_TIMEOUT", "45"))
 def log(fmt, *args):
     if DEBUG:
         sys.stderr.write((fmt % args) + "\n")
+
+
+def note(fmt, *args):
+    """For the few lines worth having in production logs without DEBUG.
+
+    What ffmpeg actually probed is the only evidence that a tune came up with
+    audio, and it is otherwise thrown away (stderr used to go to /dev/null).
+    """
+    sys.stderr.write((fmt % args) + "\n")
+
+
+# "  Stream #0:1[0x101](eng): Audio: ac3 ([129][0][0][0] / 0x0081), 48 kHz, ..."
+# search(), not match(): ffmpeg indents the block by two spaces.
+STREAM_RE = re.compile(r"Stream #(\d+):(\d+)[^:]*?: (Video|Audio|Subtitle|Data): ([\w0-9]+)")
 
 
 def tget(path, timeout=15):
@@ -134,6 +173,8 @@ class Session:
         self.end = 0                # absolute write position
         self.readers = 0
         self.proc = None
+        self.probe = {}
+        self.stopping = False
         self.dead = False
         self.ready = threading.Event()
         self.error = None
@@ -165,17 +206,85 @@ class Session:
             raise Busy("tablo returned no playlist_url")
         self.master_url = w["playlist_url"]
         log("session %s: tuner allocated in %.2fs", self.oid, time.time() - started)
-        self.proc = subprocess.Popen(
-            [FFMPEG, "-hide_banner", "-loglevel", "error", "-nostdin",
-             "-analyzeduration", "0", "-probesize", "32768",
+        for attempt in range(1, PROBE_TRIES + 1):
+            widen = RETRY_WIDEN ** (attempt - 1)
+            self.proc, self.probe = self._spawn(
+                w["playlist_url"],
+                PROBESIZE * widen,
+                min(ANALYZEDURATION * widen, RETRY_MAX_ANALYZE))
+            known = self.probe["done"].wait(PROBE_INFO_TIMEOUT)
+            streams = list(self.probe["streams"])
+            if streams:
+                note("session %s: probed streams: %s", self.oid,
+                     ", ".join("%s/%s" % s for s in streams))
+            kinds = {kind for kind, _ in streams}
+            if not known:
+                # ffmpeg said nothing we could parse (it may have died already);
+                # hand the process on rather than retune on a guess.
+                note("session %s: no stream list from ffmpeg within %.0fs, "
+                     "continuing unchecked", self.oid, PROBE_INFO_TIMEOUT)
+                break
+            if not streams:
+                note("session %s: could not read ffmpeg's stream list, "
+                     "continuing unchecked", self.oid)
+                break
+            if "audio" in kinds:
+                break
+            if attempt >= PROBE_TRIES:
+                note("session %s: %s after %d probes; serving video only",
+                     self.oid, "/".join(sorted(kinds)), attempt)
+                break
+            note("session %s: probe %d/%d saw %s but no audio, retuning",
+                 self.oid, attempt, PROBE_TRIES, "/".join(sorted(kinds)))
+            try:
+                self.proc.kill()
+                self.proc.wait(timeout=5)
+            except Exception:               # noqa: BLE001
+                pass
+            time.sleep(RETRY_DELAY)
+        threading.Thread(target=self._pump, daemon=True).start()
+        log("session %s: ffmpeg started", self.oid)
+
+    def _spawn(self, url, probesize, analyzeduration):
+        """Start the remux; stderr is parsed for the stream list, not discarded."""
+        proc = subprocess.Popen(
+            [FFMPEG, "-hide_banner", "-loglevel", "info", "-nostats", "-nostdin",
+             "-analyzeduration", str(analyzeduration),
+             "-probesize", str(probesize),
              "-fflags", "+genpts+nobuffer", "-flags", "low_delay",
-             "-i", w["playlist_url"],
+             "-i", url,
              "-c", "copy", "-muxdelay", "0", "-muxpreload", "0",
              "-flush_packets", "1", "-f", "mpegts", "-"],
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, bufsize=0)
-        threading.Thread(target=self._pump, daemon=True).start()
-        log("session %s: ffmpeg started", self.oid)
+            stderr=subprocess.PIPE, bufsize=0)
+        probe = {"streams": [], "tail": [], "done": threading.Event()}
+        threading.Thread(target=self._read_stderr, args=(proc, probe),
+                         daemon=True).start()
+        return proc, probe
+
+    def _read_stderr(self, proc, probe):
+        """Drain ffmpeg's stderr for the life of the process.
+
+        The input stream block is printed once probing finishes and before
+        "Stream mapping:", so that line is the signal the layout is known.
+        """
+        in_output = False
+        for raw in iter(proc.stderr.readline, b""):
+            line = raw.decode("utf-8", "replace").rstrip()
+            if not line:
+                continue
+            probe["tail"].append(line)
+            del probe["tail"][:-20]
+            if in_output:
+                continue
+            if line.startswith("Stream mapping:") or line.startswith("Output #"):
+                in_output = True
+                probe["done"].set()
+                continue
+            m = STREAM_RE.search(line)
+            if m:
+                probe["streams"].append((m.group(3).lower(), m.group(4)))
+        probe["done"].set()
 
     def wait_ready(self, timeout):
         if not self.ready.wait(max(0.0, timeout)):
@@ -204,9 +313,14 @@ class Session:
         with self.lock:
             self.dead = True
             self.lock.notify_all()
+        if not self.stopping:
+            tail = [l for l in (self.probe.get("tail") or []) if l.strip()][-2:]
+            note("session %s: ffmpeg exited%s", self.oid,
+                 (": " + " | ".join(tail)) if tail else "")
         log("session %s: ffmpeg ended", self.oid)
 
     def stop(self):
+        self.stopping = True
         self.dead = True
         if self.proc is not None:
             try:

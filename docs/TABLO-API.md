@@ -122,13 +122,30 @@ calling `watch` per viewer.
 - `HEAD` on a stream URL that returns `200` with an empty body makes at least
   one proxy (Dispatcharr) conclude the channel is dead and replace the stream
   with an error frame. Answering `405` instead leaves it to fall back to `GET`.
-- `ffprobe` needs the first bytes quickly. Without
-  `-analyzeduration 0 -probesize 32768 -fflags +genpts+nobuffer` and
+- `ffprobe` needs the first bytes quickly. Without `-fflags +genpts+nobuffer` and
   `-flush_packets 1` on output, ffmpeg buffers long enough that probing times
   out — the symptom is "streams and format are both null" in the client log.
+- The input probe window is a trade-off, not a free win. With `-c copy` the
+  output stream set is fixed once ffmpeg has probed, so if the first programme
+  map it sees carries **only the video PID** the session serves video-only for
+  its whole life — and, because sessions are cached and fanned out, for every
+  reader that attaches to it. Probing wider (`-probesize`, `-analyzeduration`)
+  is what sees the AC-3 PID, because the device rewrites the PMT per segment.
+  Probing wider also delays the first byte, which is the failure above, so the
+  window is bounded: `PROBESIZE` 1,000,000 bytes and `ANALYZEDURATION`
+  3,000,000 µs by default. At OTA bitrates the byte limit binds first — roughly
+  half a second at 15 Mbps, a few seconds on a thin subchannel.
+- The bridge logs `probed streams: …` for every tune, so a video-only session
+  says so in the log instead of only in the client. When a probe finds video
+  and no audio it retunes the same Tablo session before serving (`PROBE_TRIES`,
+  default 2): the retry widens the window fourfold (capped at 6 s of media) and
+  waits 1.5 s first, because a retry that re-reads the same segment cannot see a
+  different programme map. The `watch` call is not repeated, so no tuner is
+  reallocated.
 
 ## Codecs
 
-H.264 video (1080i or 720p depending on the station) with AAC audio, wrapped in
-MPEG-TS after the segments are concatenated. Stream copy works; no transcoding
-is needed to remux.
+H.264 video (1080i or 720p depending on the station) with AC-3 audio (ATSC
+A/52) — not AAC, which is what the client-facing transcode of a media server
+would produce. Wrapped in MPEG-TS after the segments are concatenated. Stream
+copy works; no transcoding is needed to remux.

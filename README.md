@@ -77,6 +77,10 @@ Channel numbers and `tvg-id`s already match, so no manual mapping is needed.
 | `GROUP_NAME` | bridge | M3U `group-title`, default `Live TV` |
 | `GUIDE_XML` | bridge | file served at `/guide.xml`, default `/data/guide.xml` |
 | `FFMPEG` | bridge | ffmpeg binary, default `ffmpeg` |
+| `PROBESIZE` | bridge | bytes ffmpeg may read before it settles the stream list, default `1000000` |
+| `ANALYZEDURATION` | bridge | cap on that probe in microseconds, default `3000000` (3 s) |
+| `PROBE_TRIES` | bridge | retunes the session if the probe sees video but no audio, default `2` |
+| `PROBE_INFO_TIMEOUT` | bridge | seconds to wait for ffmpeg's stream list, default `8` |
 | `EPG_CONFIG` | epg | channel map, default `/data/channels.json` |
 | `EPG_OUT` | epg | output guide, default `/data/guide.xml` |
 | `EPG_INTERVAL` | epg | refresh seconds, default `21600` (6h) |
