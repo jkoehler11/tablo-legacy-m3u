@@ -620,7 +620,7 @@ class TSInjector:
             pts = int(self.video_pts + (due - self.video_wall) * 90000) & ((1 << 33) - 1)
             segments = payload if payload is not None else dvbcc.clear_display_set()
             packet, self.sub_cc = dvbcc.ts_packets(
-                dvbcc.SUBTITLE_PID, dvbcc.pes(pts, segments, with_header=False),
+                dvbcc.SUBTITLE_PID, dvbcc.pes(pts, segments, with_header=True),
                 self.sub_cc)
             out += packet
             if payload is None:
@@ -972,11 +972,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_HEAD(self):
         path = self.path.split("?")[0]
-        if (path.startswith("/stream/") or path.startswith("/cc/")
-                or (path.startswith("/hls/") and path.endswith(".m3u8"))):
+        # An endless TS has no length, so a 200-with-Content-Length:0 tells a
+        # client the stream is empty - VLC answers "input can't be opened" and
+        # Dispatcharr's probe marks the channel dead. Answer 405 instead; only
+        # the HLS playlist, which is a real document, gets a 200.
+        if path.startswith("/hls/") and path.endswith(".m3u8"):
             self.send_response(200)
-            self.send_header("Content-Type", "application/vnd.apple.mpegurl"
-                             if path.endswith(".m3u8") else "video/mp2t")
+            self.send_header("Content-Type", "application/vnd.apple.mpegurl")
             self.send_header("Content-Length", "0")
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
