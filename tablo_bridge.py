@@ -484,6 +484,18 @@ class TSInjector:
         if pid == self.pat_pid and self.pmt_pid is None:
             self._read_pat(pkt)
             return pkt
+        # Adopt a PMT even before the PAT has shown up. A downstream remuxer
+        # (Dispatcharr's ffmpeg) fixes its output stream map on the *first* PMT
+        # it sees, so passing one through unmodified costs the caption PID for
+        # the whole session - which is exactly what Jellyfin probed as
+        # "video+audio only".
+        if self.pmt_pid is None and (pkt[1] & 0x40):
+            payload = self._payload(pkt)
+            if payload:
+                ptr = payload[0]
+                if len(payload) > 1 + ptr and payload[1 + ptr] == 0x02:
+                    self.pmt_pid = pid
+                    note("captions: adopted PMT pid %d", pid)
         if self.pmt_pid is not None and pid == self.pmt_pid:
             if self.pmt_new is None:
                 self._read_pmt(pkt)
