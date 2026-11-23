@@ -154,3 +154,28 @@ the example uses epgshare01.
 MIT. Unaffiliated with Nuvyyo/Tablo. This talks to an undocumented API on
 end-of-life hardware; it can break whenever the device firmware changes, and
 the vendor has already stopped supporting these models.
+## Closed captions
+
+The Tablo carries CEA-608/708 inside the H.264 SEI. Jellyfin cannot select an SEI
+caption track (it is in the video bitstream, not a subtitle stream) and MPEG-TS has
+no text subtitle type ffmpeg can encode, so the only form every client renders is
+captions burned into the picture:
+
+- `/playlist.m3u?cc=1` — one `NAME CC` entry per channel. The entries publish
+  `tvg-id="<CALL>-CC"` because Dispatcharr identifies a stream by `tvg_id` alone,
+  so a variant sharing the plain call sign collapses onto the plain stream.
+- `/cc/<oid>.ts` — that channel with captions drawn in: `libx264 -preset ultrafast
+  -tune zerolatency -crf 23`, audio copied. Costs roughly 4.5x realtime of one
+  core on an N100 per captioned session; `CC_MAX` (default 2) caps concurrency.
+- Plain `/stream/<oid>.ts` stays stream-copy and carries no captions. `/hls/`
+  cannot (it proxies the device playlist) and answers 501 for `cc=1`.
+
+Extraction is a feeder ffmpeg (`-i <watch url> -c copy -f mpegts -`) piped into
+`movie=/dev/stdin[out0+subcc]`, because `movie=` cannot take an HTTP URL and a
+watch URL answers with a playlist, not media. The current cue is written to a file
+and drawn with `drawtext=textfile=...:reload=1`; cue write times are compared
+against cue start times so the encoder stays in step with the extractor.
+
+`/healthz` shows each session with `cc` and the caption text it is currently
+holding, which is the fastest way to tell "no captions in this programme" from
+"the extractor broke".
