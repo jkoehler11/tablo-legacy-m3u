@@ -115,13 +115,14 @@ def display_set(rows, width, height, x, y, display_w, display_h,
            + top + bottom)
 
     return (_seg(0x14, dds) + _seg(0x10, page) + _seg(0x12, clut)
-            + _seg(0x11, region) + _seg(0x13, obj) + _seg(0x80, b""))
+            + _seg(0x11, region) + _seg(0x13, obj) + _seg(0x80, b"")
+            + b"\xff")   # end-of-payload marker: VLC drops the block without it
 
 
 def clear_display_set(page_version=0):
     """Page with no regions: removes whatever is on screen."""
     page = bytes([1, (page_version << 4) | (2 << 2) | 3])
-    return _seg(0x10, page) + _seg(0x80, b"")
+    return _seg(0x10, page) + _seg(0x80, b"") + b"\xff"
 
 
 def _pts_bytes(pts):
