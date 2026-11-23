@@ -156,26 +156,32 @@ end-of-life hardware; it can break whenever the device firmware changes, and
 the vendor has already stopped supporting these models.
 ## Closed captions
 
-The Tablo carries CEA-608/708 inside the H.264 SEI. Jellyfin cannot select an SEI
-caption track (it is in the video bitstream, not a subtitle stream) and MPEG-TS has
-no text subtitle type ffmpeg can encode, so the only form every client renders is
-captions burned into the picture:
+The Tablo carries CEA-608/708 inside the H.264 SEI, which no player can select as a
+track, and a transport stream has no text subtitle type — so the bridge converts the
+captions to **DVB subtitles (bitmap)** and muxes them into the same TS:
 
-- `/playlist.m3u?cc=1` — one `NAME CC` entry per channel. The entries publish
-  `tvg-id="<CALL>-CC"` because Dispatcharr identifies a stream by `tvg_id` alone,
-  so a variant sharing the plain call sign collapses onto the plain stream.
-- `/cc/<oid>.ts` — that channel with captions drawn in: `libx264 -preset ultrafast
-  -tune zerolatency -crf 23`, audio copied. Costs roughly 4.5x realtime of one
-  core on an N100 per captioned session; `CC_MAX` (default 2) caps concurrency.
-- Plain `/stream/<oid>.ts` stays stream-copy and carries no captions. `/hls/`
-  cannot (it proxies the device playlist) and answers 501 for `cc=1`.
+- `/stream/<oid>.ts` relays `h264 + aac + dvb_subtitle`. Video is still `-c copy`;
+  `?cc=0` asks for the bare relay without the subtitle PID.
+- `dvbcc.py` renders each cue to a 2-bit bitmap with an alpha threshold and encodes
+  EN 300 743 display sets (display definition, page/region composition, CLUT, object
+  data with the interlaced field split and 2-bit RLE).
+- `TSInjector` reads the PAT, rewrites the PMT once to append PID `0x1A0`
+  (stream type `0x06` + subtitling descriptor), tracks `(video PTS, wallclock)` from
+  each video PES start, and splices caption PES ahead of the packet whose PTS is due.
+  A cue's end emits an empty page composition, which clears the screen.
 
-Extraction is a feeder ffmpeg (`-i <watch url> -c copy -f mpegts -`) piped into
-`movie=/dev/stdin[out0+subcc]`, because `movie=` cannot take an HTTP URL and a
-watch URL answers with a playlist, not media. The current cue is written to a file
-and drawn with `drawtext=textfile=...:reload=1`; cue write times are compared
-against cue start times so the encoder stays in step with the extractor.
+Extraction needs the lavfi `movie` source: this image's ffmpeg has no `subcc` filter,
+but `movie=<path>[out0+subcc]` works, and it cannot take a URL — so a feeder ffmpeg
+re-muxes the device playlist onto stdout and the extractor reads `/dev/stdin`.
 
-`/healthz` shows each session with `cc` and the caption text it is currently
-holding, which is the fastest way to tell "no captions in this programme" from
+### Dispatcharr note
+
+Dispatcharr's **Proxy** profile rebuilds PSI from its own template and forwards only
+the PIDs it knows about, so it drops the caption PID. Channels pointing at this bridge
+need the **FFmpeg** profile (`-map 0 -max_interleave_delta 100K -c copy -f mpegts`),
+which passes the subtitle through. `jellyfin-ffmpeg` against
+`/proxy/ts/stream/<uuid>` should then report `h264, aac, dvb_subtitle`.
+
+`/healthz` shows per-session `text` (the cue currently on screen) and `injected`
+(caption PES emitted) — the fastest way to tell "no captions in this programme" from
 "the extractor broke".

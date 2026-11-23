@@ -9,8 +9,8 @@ Endpoints
   /hls/<oid>.m3u8        HLS for one channel, proxied from the Tablo session
   /hls/seg?oid=&u=       segment proxy (forwards Range, preserves byteranges)
   /stream/<oid>.ts       raw MPEG-TS relay of the same session
-  /cc/<oid>.ts           the same relay with CEA-608 captions burned in
-  /playlist.m3u?cc=1     a captioned variant of every channel (TS only)
+  /stream/<oid>.ts       the relay, carrying CEA-608 as a DVB subtitle PID
+                         (?cc=0 asks for the bare relay instead)
   /guide.xml             XMLTV (served from GUIDE_XML when present)
   /healthz               bridge + device liveness
 
@@ -24,6 +24,7 @@ while one client is waiting for the device the next request can attach to the
 same warming session instead of queueing behind a global lock (that serialisation
 was what made a 3-retry proxy give up).
 """
+import collections
 import json
 import os
 import re
@@ -37,6 +38,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import dvbcc
 
 TABLO = os.environ.get("TABLO_HOST", "").strip()
 PORT = int(os.environ.get("PORT", "8050"))
@@ -205,47 +208,41 @@ class Busy(Exception):
 
 
 class CCWorker:
-    """Keep one channel's current caption text in a file ffmpeg can draw.
+    """Turn one channel's CEA-608 into DVB subtitle display sets, ready to splice.
 
     Extraction needs the lavfi `movie` source: the Debian ffmpeg in this image
     has no `subcc` filter, but `movie=<path>[out0+subcc]` still decodes CC1. It
     cannot be handed a URL (the graph parser splits the value at the colons),
     and it cannot be handed a Tablo watch URL either way - that answers with a
     playlist, not media - so a feeder ffmpeg turns the device's HLS into a plain
-    TS on stdout and the extractor reads it as /dev/stdin. The feeder also keeps
-    the extractor's clock honest: it starts at the live edge and re-muxes, so
-    the bytes are continuous even where the device changes segment tokens.
+    TS on stdout and the extractor reads it as /dev/stdin.
 
-    The clock is the extractor's, not wall time. It starts counting when it
-    opens its input, a fraction of a second before or after the burn-in encoder
-    opens the playlist, so cue write times are compared against cue start times
-    to learn that difference and keep the two processes in step.
+    Each cue is rendered once, by drawtext, into a 2-bit bitmap, and encoded as
+    a DVB subtitling display set (see dvbcc). The injector only has to stamp a
+    PTS on it and splice it in, which is what keeps the video stream untouched.
     """
 
     def __init__(self, oid):
         self.dir = tempfile.mkdtemp(prefix="cc-%s-" % oid)
         self.vtt = os.path.join(self.dir, "cc.vtt")
-        self.now = os.path.join(self.dir, "now.txt")
         self.err = os.path.join(self.dir, "cc.err")
         self.feed_err = os.path.join(self.dir, "feed.err")
         self.proc = None
         self.feeder = None
         self.stopping = False
-        self.cues = []                  # [(start, end, text)]
-        self.pending = None
+        self.cues = []                  # [(id, start, end, text)]
+        self.payloads = {}              # cue id -> display-set segments
+        self.events = collections.deque()   # [(wallclock, payload or None)]
+        self.pending_cue = None
         self.buf = ""
         self.samples = []
         self.offset = None              # wall clock minus extractor clock
         self.text = ""
-        self._write("")
-
-    @property
-    def filter(self):
-        """drawtext expression handed to the burn-in encoder."""
-        return ("drawtext=textfile='%s':reload=1:fontfile='%s':fontsize=%s:"
-                "fontcolor=white:box=1:boxcolor=black@0.65:boxborderw=12:"
-                "line_spacing=8:x=(w-text_w)/2:y=h-th-h/18"
-                % (self.now, CC_FONT, CC_FONTSIZE))
+        self.shown = None               # cue id on screen
+        self.next_id = 0
+        self.dim = None                 # (width, height) of the video
+        self._wrote = ""
+        os.makedirs(self.dir, exist_ok=True)
 
     def start(self, url):
         self.offset = time.time()
@@ -255,7 +252,7 @@ class CCWorker:
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
             stderr=open(self.feed_err, "wb"), bufsize=0)
         self.proc = subprocess.Popen(
-            [FFMPEG, "-hide_banner", "-loglevel", "warning", "-nostats", "-nostdin",
+            [FFMPEG, "-hide_banner", "-loglevel", "info", "-nostats", "-nostdin",
              "-f", "lavfi", "-i", "movie=/dev/stdin[out0+subcc]",
              "-map", "0:s", "-c:s", "webvtt", "-flush_packets", "1",
              "-f", "webvtt", self.vtt],
@@ -276,6 +273,28 @@ class CCWorker:
                 except Exception:       # noqa: BLE001
                     pass
         shutil.rmtree(self.dir, ignore_errors=True)
+
+    # ---- what the injector needs -----------------------------------------
+    def take_event(self, now):
+        """Oldest cue event whose display time has arrived, or None."""
+        if not self.events:
+            return None
+        wall, payload = self.events[0]
+        if wall > now:
+            return None
+        self.events.popleft()
+        return payload
+
+    def take_due(self, now, limit=3):
+        out = []
+        while len(out) < limit:
+            ev = self.take_event(now)
+            if ev is None and not self.events:
+                break
+            if ev is None:
+                break
+            out.append(ev)
+        return out
 
     # ---- webvtt -> current line ------------------------------------------
     def _run(self):
@@ -303,7 +322,7 @@ class CCWorker:
                 self._flush()
                 start = self._secs(m.group(1), m.group(2))
                 end = self._secs(m.group(3), m.group(4))
-                self.pending = {"start": start, "end": end, "lines": []}
+                self.pending_cue = {"start": start, "end": end, "lines": []}
                 self.samples.append(time.time() - start)
                 del self.samples[:-8]
                 if self.samples:
@@ -311,8 +330,8 @@ class CCWorker:
                 continue
             if not line.strip():
                 self._flush()
-            elif self.pending is not None:
-                self.pending["lines"].append(line)
+            elif self.pending_cue is not None:
+                self.pending_cue["lines"].append(line)
 
     @staticmethod
     def _secs(stamp, frac):
@@ -323,14 +342,20 @@ class CCWorker:
                 + int(frac) / (10 ** len(frac)))
 
     def _flush(self):
-        p, self.pending = self.pending, None
+        p, self.pending_cue = self.pending_cue, None
         if not p:
             return
         text = self._clean(p["lines"])
         if not text:
             return
-        self.cues.append((p["start"], p["end"], text))
+        cue_id = self.next_id
+        self.next_id += 1
+        self.cues.append((cue_id, p["start"], p["end"], text))
         del self.cues[:-12]
+        try:
+            self.payloads[cue_id] = self._render(text)
+        except Exception as exc:            # noqa: BLE001
+            log("captions: render failed (%s)", exc)
 
     @staticmethod
     def _clean(lines):
@@ -343,39 +368,265 @@ class CCWorker:
             out.append(line[:CC_COLS])
         return "\n".join(out[:CC_LINES])
 
+    def _size(self):
+        """Video resolution, read from the extractor's own probe output."""
+        if self.dim:
+            return self.dim
+        try:
+            with open(self.err, "r", errors="replace") as f:
+                m = re.search(r"(\d{3,4})x(\d{3,4})", f.read())
+            if m:
+                self.dim = (int(m.group(1)), int(m.group(2)))
+        except OSError:
+            pass
+        return self.dim or (1920, 1080)
+
+    def _render(self, text):
+        """One cue -> 2-bit bitmap -> DVB display-set segments."""
+        vw, vh = self._size()
+        rw = vw - 2 * (vw // 6)
+        rh = max(48, (vh // 6) - (vh // 6) % 2)
+        rx, ry = (vw - rw) // 2, vh - rh - vh // 14
+        fontsize = max(18, rh // 4)
+        tf = os.path.join(self.dir, "cue.txt")
+        with open(tf, "w") as f:
+            f.write(text)
+        cmd = [FFMPEG, "-v", "error", "-f", "lavfi",
+               "-i", "color=c=black@0.0:s=%dx%d,format=rgba" % (rw, rh),
+               "-vf", ("drawtext=textfile=%s:fontsize=%d:fontcolor=white:box=1:"
+                       "boxcolor=black@1.0:boxborderw=%d:line_spacing=%d:"
+                       "x=(w-text_w)/2:y=(h-th)/2"
+                       % (tf, fontsize, max(6, rh // 12), max(2, rh // 20))),
+               "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgba", "-"]
+        raw = subprocess.run(cmd, capture_output=True, timeout=20).stdout
+        if len(raw) < rw * rh * 4:
+            raise Busy("drawtext produced no frame")
+        rows = []
+        for y in range(rh):
+            line = raw[y * rw * 4:(y + 1) * rw * 4]
+            row = []
+            for x in range(rw):
+                r, g, b, a = line[x * 4:x * 4 + 4]
+                if a < 32:
+                    row.append(0)
+                elif (r + g + b) / 3 > 128:
+                    row.append(2)
+                else:
+                    row.append(1)
+            rows.append(row)
+        return dvbcc.display_set(rows, rw, rh, rx, ry, vw, vh)
+
     def _tick(self):
         if self.offset is None:
             return
         rel = time.time() - self.offset
-        text = ""
-        for start, end, cue in reversed(self.cues):
+        cue = None
+        for cid, start, end, text in reversed(self.cues):
             if rel > end + CC_HOLD:
                 break
             if rel >= start:
-                text = cue
+                cue = (cid, text)
                 break
-        if text != self.text:
-            self.text = text
-            self._write(text)
+        if cue is None and self.shown is None:
+            return
+        if cue is not None and cue[0] == self.shown:
+            return
+        self.shown = cue[0] if cue else None
+        self.text = cue[1] if cue else ""
+        payload = None
+        if cue is not None:
+            payload = self.payloads.get(cue[0])
+            if payload is None:
+                try:
+                    payload = self.payloads[cue[0]] = self._render(cue[1])
+                except Exception as exc:    # noqa: BLE001
+                    log("captions: render failed (%s)", exc)
+                    return
+        self.events.append((time.time(), payload))
 
-    def _write(self, text):
-        tmp = self.now + ".tmp"
-        try:
-            with open(tmp, "w") as f:
-                f.write(text)
-            os.replace(tmp, self.now)
-        except Exception as exc:        # noqa: BLE001
-            log("captions: text write failed (%s)", exc)
+
+class TSInjector:
+    """Adds a DVB subtitle PID to a live TS and splices captions into it.
+
+    The relayed stream is never re-encoded: the PAT is read to find the PMT, the
+    PMT is rewritten once to carry a private-data stream with a subtitling
+    descriptor, and caption PES packets are inserted ahead of the video packet
+    whose PTS they belong to.
+    """
+
+    def __init__(self, captions):
+        self.cc = captions
+        self.buf = b""
+        self.pat_pid = 0
+        self.pmt_pid = None
+        self.video_pid = None
+        self.pmt_new = None
+        self.pmt_cc = 0
+        self.sub_cc = 0
+        self.video_pts = None
+        self.video_wall = None
+        self.injected = 0
+        self.cleared = 0
+
+    def feed(self, chunk):
+        data = self.buf + chunk
+        usable = len(data) - (len(data) % 188)
+        self.buf = data[usable:]
+        out = bytearray()
+        for pos in range(0, usable, 188):
+            out += self._packet(data[pos:pos + 188])
+        return bytes(out)
+
+    def _packet(self, pkt):
+        if len(pkt) < 188 or pkt[0] != 0x47:
+            return b""                       # resync: drop, next packet will land
+        pid = ((pkt[1] & 0x1F) << 8) | pkt[2]
+        if pid == self.pat_pid and self.pmt_pid is None:
+            self._read_pat(pkt)
+            return pkt
+        if self.pmt_pid is not None and pid == self.pmt_pid:
+            if self.pmt_new is None:
+                self._read_pmt(pkt)
+            if self.pmt_new is None:
+                return pkt
+            return self._pmt_packets(pkt)
+        if pid == self.video_pid:
+            if pkt[1] & 0x40:                # payload unit start: PES header here
+                pts = self._pes_pts(pkt)
+                if pts is not None:
+                    self.video_pts, self.video_wall = pts, time.time()
+                return self._captions() + pkt
+        return pkt
+
+    # ---- PSI -------------------------------------------------------------
+    @staticmethod
+    def _payload(pkt):
+        afc = (pkt[3] >> 4) & 0x03
+        off = 4
+        if afc & 0x02:
+            off += 1 + pkt[4]
+        return pkt[off:] if afc & 0x01 else b""
+
+    def _read_pat(self, pkt):
+        payload = self._payload(pkt)
+        if len(payload) < 12 or not (pkt[1] & 0x40):
+            return
+        ptr = payload[0]
+        sec = payload[1 + ptr:]
+        if len(sec) < 12 or sec[0] != 0x00:
+            return
+        # first program entry after the 8-byte header
+        prog = sec[8:12]
+        self.pmt_pid = ((prog[2] & 0x1F) << 8) | prog[3]
+
+    def _read_pmt(self, pkt):
+        payload = self._payload(pkt)
+        if len(payload) < 16 or not (pkt[1] & 0x40):
+            return
+        ptr = payload[0]
+        sec = payload[1 + ptr:]
+        if len(sec) < 16 or sec[0] != 0x02:
+            return
+        total = 3 + (((sec[1] & 0x0F) << 8) | sec[2])
+        if total > len(sec):
+            return                            # multi-packet PMT: leave it alone
+        section = bytearray(sec[:total])
+        prog_len = ((section[10] & 0x0F) << 8) | section[11]
+        pos = 12 + prog_len
+        end = total - 4                       # CRC
+        q = pos
+        while q + 5 <= end:
+            stype = section[q]
+            epid = ((section[q + 1] & 0x1F) << 8) | section[q + 2]
+            es_len = ((section[q + 3] & 0x0F) << 8) | section[q + 4]
+            if stype in (0x01, 0x02, 0x1B, 0x24):
+                self.video_pid = epid
+            q += 5 + es_len
+        if self.video_pid is None:
+            return
+        ours = (bytes([0x06, 0xE0 | (dvbcc.SUBTITLE_PID >> 8),
+                       dvbcc.SUBTITLE_PID & 0xFF, 0xF0, 10,
+                       0x59, 0x08]) + dvbcc.SUBTITLE_LANG
+                + bytes([dvbcc.SUBTITLE_TYPE]) + b"\x00\x01\x00\x01")
+        body = bytes(section[8:end]) + ours      # head below already carries 3..7
+        # section_length spans everything after the length field: the 5 header
+        # bytes that remain, the body, and the 4-byte CRC.
+        length = len(body) + 9
+        head = bytes([0x02, 0xB0 | (length >> 8), length & 0xFF,
+                      section[3], section[4], section[5], section[6], section[7]])
+        new = head + body
+        new = new + dvbcc.crc32(new).to_bytes(4, "big")
+        self.pmt_new = new
+
+    def _pmt_packets(self, pkt):
+        self.pmt_cc = (self.pmt_cc + 1) & 0x0F
+        data = b"\x00" + self.pmt_new            # pointer_field
+        out = bytearray()
+        pos = 0
+        first = True
+        while pos < len(data):
+            chunk = data[pos:pos + 184]
+            pos += len(chunk)
+            af = b""
+            afc = 0x10
+            if len(chunk) < 184:
+                pad = 184 - len(chunk) - 1
+                af = bytes([pad, 0x00]) + (b"\xff" * (pad - 1) if pad else b"")
+                afc = 0x30
+            out += bytes([0x47,
+                          (0x40 if first else 0x00) | ((self.pmt_pid >> 8) & 0x1F),
+                          self.pmt_pid & 0xFF, afc | self.pmt_cc]) + af + chunk
+            first = False
+        return bytes(out)
+
+    @staticmethod
+    def _pes_pts(pkt):
+        payload = TSInjector._payload(pkt)
+        if len(payload) < 14 or payload[0:3] != b"\x00\x00\x01":
+            return None
+        flags = payload[7] >> 6
+        if not flags & 0x02:                  # PTS_DTS_flags: no PTS
+            return None
+        q = payload[9:14]
+        if len(q) < 5:
+            return None
+        return ((((q[0] >> 1) & 0x07) << 30) | (q[1] << 22)
+                | (((q[2] >> 1) & 0x7F) << 15) | (q[3] << 7)
+                | ((q[4] >> 1) & 0x7F))
+
+    # ---- captions --------------------------------------------------------
+    def _captions(self):
+        if self.video_pts is None:
+            return b""
+        now = time.time()
+        payloads = self.cc.take_due(now)
+        if not payloads:
+            return b""
+        out = b""
+        for payload in payloads:
+            due = now
+            pts = int(self.video_pts + (due - self.video_wall) * 90000) & ((1 << 33) - 1)
+            segments = payload if payload is not None else dvbcc.clear_display_set()
+            packet, self.sub_cc = dvbcc.ts_packets(
+                dvbcc.SUBTITLE_PID, dvbcc.pes(pts, segments, with_header=False),
+                self.sub_cc)
+            out += packet
+            if payload is None:
+                self.cleared += 1
+            else:
+                self.injected += 1
+        return out
 
 
 class Session:
     """One Tablo tuner, shared by every reader of that channel."""
 
-    def __init__(self, oid, cc=False):
+    def __init__(self, oid, cc=True):
         self.oid = oid
         self.cc = cc
-        self.key = "%s|cc" % oid if cc else oid
+        self.key = oid
         self.captions = None
+        self.injector = None
         self.lock = threading.Condition()
         self.chunks = []            # [(abs_offset, bytes)]
         self.base = 0               # absolute offset of chunks[0]
@@ -415,10 +666,11 @@ class Session:
             raise Busy("tablo returned no playlist_url")
         self.master_url = w["playlist_url"]
         if self.cc:
-            # Start the extractor first: it needs a couple of seconds of stream
-            # before the first cue, and the encoder only has to pick up text.
+            # Captions are part of the relay now: the extractor starts first so
+            # the injector has cues, but the video itself is never re-encoded.
             self.captions = CCWorker(self.oid)
             self.captions.start(w["playlist_url"])
+            self.injector = TSInjector(self.captions)
         log("session %s: tuner allocated in %.2fs", self.key, time.time() - started)
         for attempt in range(1, PROBE_TRIES + 1):
             widen = RETRY_WIDEN ** (attempt - 1)
@@ -471,13 +723,7 @@ class Session:
                "-probesize", str(probesize),
                "-fflags", "+genpts+nobuffer", "-flags", "low_delay",
                "-i", url]
-        if self.cc and self.captions is not None:
-            cmd += ["-map", "0:v:0", "-map", "0:a:0", "-vf", self.captions.filter,
-                    "-c:v", "libx264", "-preset", CC_PRESET, "-tune", "zerolatency",
-                    "-crf", CC_CRF, "-pix_fmt", "yuv420p", "-g", "60",
-                    "-c:a", "copy"]
-        else:
-            cmd += ["-c", "copy"]
+        cmd += ["-c", "copy"]
         cmd += ["-muxdelay", "0", "-muxpreload", "0",
                 "-flush_packets", "1", "-f", "mpegts", "-"]
         proc = subprocess.Popen(
@@ -530,6 +776,13 @@ class Session:
                 break
             if not data:
                 break
+            if self.injector is not None:
+                try:
+                    data = self.injector.feed(data)
+                except Exception as exc:        # noqa: BLE001
+                    log("session %s: injector error (%s)", self.key, exc)
+            if not data:
+                continue
             with self.lock:
                 self.chunks.append((self.end, data))
                 self.end += len(data)
@@ -644,8 +897,8 @@ class Registry:
         victim.stop()
         self.sessions.pop(victim.key, None)
 
-    def acquire(self, oid, wait=0.0, cc=False):
-        key = "%s|cc" % oid if cc else oid
+    def acquire(self, oid, wait=0.0, cc=True):
+        key = oid
         with self.lock:
             s = self.sessions.get(key)
             if s is not None and s.dead and s.ready.is_set():
@@ -653,9 +906,6 @@ class Registry:
                 s = None
             fresh = s is None
             if fresh:
-                if cc and sum(1 for x in self.sessions.values()
-                              if x.cc and not x.dead) >= CC_MAX:
-                    raise Busy("captions already running on %d channels" % CC_MAX)
                 self._make_room(key)
                 s = Session(oid, cc)
                 self.sessions[key] = s
@@ -668,8 +918,9 @@ class Registry:
     def snapshot(self):
         with self.lock:
             return {key: {"readers": s.readers, "ready": s.ready.is_set(),
-                          "dead": s.dead, "cc": s.cc, "buf": s.end - s.base,
-                          "text": (s.captions.text[-60:] if s.captions else "")}
+                          "dead": s.dead, "buf": s.end - s.base,
+                          "text": (s.captions.text[-60:] if s.captions else ""),
+                          "injected": (s.injector.injected if s.injector else 0)}
                     for key, s in self.sessions.items()}
 
     def reap(self):
@@ -690,7 +941,7 @@ REG = Registry()
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-    server_version = "tablo-bridge/2.2"
+    server_version = "tablo-bridge/2.3"
 
     def log_message(self, fmt, *args):
         if DEBUG:
@@ -731,7 +982,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if path in ("/", "/index.html"):
                 self._send(200, "tablo-bridge: /playlist.m3u /hls/<id>.m3u8 /stream/<id>.ts "
-                                "/cc/<id>.ts /playlist.m3u?cc=1 "
+                                ""
                                 "/guide.xml /healthz\n")
             elif path == "/healthz":
                 self._send(200, json.dumps({"tablo": TABLO, "channels": len(channels()),
@@ -749,15 +1000,12 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/hls/seg.ts":
                 self.segment(query)
             elif path.startswith("/hls/") and path.endswith(".m3u8"):
-                if (query.get("cc") or ["0"])[0] in ("1", "true", "yes"):
-                    self._send(501, "captions need the raw-TS path: "
-                                    "/stream/<id>.ts?cc=1\n")
-                    return
                 self.hls(host, path[len("/hls/"):].split(".")[0])
             elif path.startswith("/cc/") and path.endswith(".ts"):
                 self.stream(path[len("/cc/"):].split(".")[0], True)
             elif path.startswith("/stream/"):
-                cc = (query.get("cc") or ["0"])[0] in ("1", "true", "yes")
+                # captions ride along by default; ?cc=0 asks for the bare relay
+                cc = (query.get("cc") or ["1"])[0] not in ("0", "false", "no")
                 self.stream(path[len("/stream/"):].split(".")[0], cc)
             else:
                 self._send(404, "not found\n")
@@ -843,7 +1091,7 @@ def main():
     threading.Thread(target=REG.reap, daemon=True).start()
     srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     srv.daemon_threads = True
-    sys.stderr.write("tablo-bridge 2.2 listening on :%d (tablo %s)\n" % (PORT, TABLO))
+    sys.stderr.write("tablo-bridge 2.3 listening on :%d (tablo %s)\n" % (PORT, TABLO))
     srv.serve_forever()
 
 
